@@ -262,18 +262,6 @@ export class State {
     return eqSet(this.set, set)
   }
 
-  _actionsByTerm: null | {[id: number]: (Shift | Reduce)[]} = null
-
-  actionsByTerm() {
-    let result = this._actionsByTerm
-    if (!result) {
-      this._actionsByTerm = result = Object.create(null) as {[id: number]: (Shift | Reduce)[]}
-      for (let action of this.actions)
-        (result[action.term.id] || (result[action.term.id] = [])).push(action)
-    }
-    return result
-  }
-
   finish() {
     if (this.actions.length) {
       let first = this.actions[0]
@@ -550,26 +538,81 @@ function applyCut(set: readonly Pos[]): readonly Pos[] {
   return found || set
 }
 
+function actionsConflict(actionsA: readonly (Shift | Reduce)[], startA: number, endA: number,
+                         actionsB: readonly (Shift | Reduce)[], startB: number, endB: number,
+                         mapping: readonly number[]) {
+  for (let i = startA; i < endA; i++)
+    for (let j = startB; j < endB; j++)
+      if (!actionsB[j].matches(actionsA[i], mapping)) return true
+  return false
+}
+
+function hasMatchingAction(action: Shift | Reduce, actions: readonly (Shift | Reduce)[],
+                           start: number, end: number, mapping: readonly number[]) {
+  for (let i = start; i < end; i++) if (action.matches(actions[i], mapping)) return true
+  return false
+}
+
 // Verify that there are no conflicting actions or goto entries in the
 // two given states (using the state ID remapping provided in mapping)
 function canMerge(a: State, b: State, mapping: readonly number[]) {
   // If a goto for the same term differs, that makes the states
   // incompatible
-  for (let goto of a.goto) for (let other of b.goto) {
-    if (goto.term == other.term && mapping[goto.target.id] != mapping[other.target.id]) return false
+  for (let iA = 0, iB = 0; iA < a.goto.length && iB < b.goto.length;) {
+    let gotoA = a.goto[iA], gotoB = b.goto[iB]
+    if (gotoA.term == gotoB.term) {
+      if (mapping[gotoA.target.id] != mapping[gotoB.target.id]) return false
+      iA++
+      iB++
+    } else if (gotoA.term.id < gotoB.term.id) {
+      iA++
+    } else {
+      iB++
+    }
   }
   // If there is an action where a conflicting action exists in the
   // other state, the merge is only allowed when both states have the
   // exact same set of actions for this term.
-  let byTerm = b.actionsByTerm()
-  for (let action of a.actions) {
-    let setB = byTerm[action.term.id]
-    if (setB && setB.some(other => !other.matches(action, mapping))) {
-      if (setB.length == 1) return false
-      let setA = a.actionsByTerm()[action.term.id]
-      if (setA.length != setB.length || setA.some(a1 => !setB.some(a2 => a1.matches(a2, mapping))))
-        return false
+  let splitA = a.actions.findIndex(action => action instanceof Reduce)
+  let splitB = b.actions.findIndex(action => action instanceof Reduce)
+  if (splitA < 0) splitA = a.actions.length
+  if (splitB < 0) splitB = b.actions.length
+  let shiftA = 0, reduceA = splitA, shiftB = 0, reduceB = splitB
+  for (;;) {
+    let shiftTermA = shiftA < splitA ? a.actions[shiftA].term : null
+    let reduceTermA = reduceA < a.actions.length ? a.actions[reduceA].term : null
+    let term = !shiftTermA ? reduceTermA : !reduceTermA ? shiftTermA
+      : shiftTermA.id < reduceTermA.id ? shiftTermA : reduceTermA
+    if (!term) break
+
+    while (shiftB < splitB && b.actions[shiftB].term.id < term.id) shiftB++
+    while (reduceB < b.actions.length && b.actions[reduceB].term.id < term.id) reduceB++
+    let endShiftA = shiftA, endReduceA = reduceA, endShiftB = shiftB, endReduceB = reduceB
+    while (endShiftA < splitA && a.actions[endShiftA].term == term) endShiftA++
+    while (endReduceA < a.actions.length && a.actions[endReduceA].term == term) endReduceA++
+    while (endShiftB < splitB && b.actions[endShiftB].term == term) endShiftB++
+    while (endReduceB < b.actions.length && b.actions[endReduceB].term == term) endReduceB++
+    let countA = endShiftA - shiftA + endReduceA - reduceA
+    let countB = endShiftB - shiftB + endReduceB - reduceB
+    if (countB) {
+      let conflict = actionsConflict(a.actions, shiftA, endShiftA, b.actions, shiftB, endShiftB, mapping) ||
+        actionsConflict(a.actions, shiftA, endShiftA, b.actions, reduceB, endReduceB, mapping) ||
+        actionsConflict(a.actions, reduceA, endReduceA, b.actions, shiftB, endShiftB, mapping) ||
+        actionsConflict(a.actions, reduceA, endReduceA, b.actions, reduceB, endReduceB, mapping)
+      if (conflict && (countB == 1 || countA != countB)) return false
+      if (conflict) {
+        for (let j = shiftA; j < endShiftA; j++)
+          if (!hasMatchingAction(a.actions[j], b.actions, shiftB, endShiftB, mapping) &&
+              !hasMatchingAction(a.actions[j], b.actions, reduceB, endReduceB, mapping)) return false
+        for (let j = reduceA; j < endReduceA; j++)
+          if (!hasMatchingAction(a.actions[j], b.actions, shiftB, endShiftB, mapping) &&
+              !hasMatchingAction(a.actions[j], b.actions, reduceB, endReduceB, mapping)) return false
+      }
     }
+    shiftA = endShiftA
+    reduceA = endReduceA
+    shiftB = endShiftB
+    reduceB = endReduceB
   }
   return true
 }
@@ -613,12 +656,19 @@ function samePosSet(a: readonly Pos[], b: readonly Pos[]) {
   return true
 }
 
+function hashPosCore(set: readonly Pos[]) {
+  let value = 5381
+  for (let pos of set) value = hash(hash(value, pos.rule.id), pos.pos)
+  return value
+}
+
 // Collapse an LR(1) automaton to an LALR-like automaton
 function collapseAutomaton(states: readonly State[]): readonly State[] {
-  let mapping: number[] = [], groups: Group[] = []
+  let mapping: number[] = [], groups: Group[] = [], groupsByCoreHash: {[hash: number]: number[]} = {}
   assignGroups: for (let i = 0; i < states.length; i++) {
     let state = states[i]
-    if (!state.startRule) for (let j = 0; j < groups.length; j++) {
+    let coreHash = hashPosCore(state.set), candidates = groupsByCoreHash[coreHash]
+    if (!state.startRule && candidates) for (let j of candidates) {
       let group = groups[j], other = states[group.members[0]]
       if (state.tokenGroup == other.tokenGroup &&
           state.skip == other.skip &&
@@ -631,6 +681,8 @@ function collapseAutomaton(states: readonly State[]): readonly State[] {
     }
     mapping.push(groups.length)
     groups.push(new Group(groups.length, i))
+    if (!state.startRule)
+      (groupsByCoreHash[coreHash] || (groupsByCoreHash[coreHash] = [])).push(groups.length - 1)
   }
 
   function spill(groupIndex: number, index: number) {
@@ -706,3 +758,4 @@ const none: readonly any[] = []
 export function finishAutomaton(full: readonly State[]) {
   return mergeIdentical(collapseAutomaton(full))
 }
+ 
