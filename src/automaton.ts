@@ -647,6 +647,9 @@ function mergeStates(states: readonly State[], mapping: readonly number[]) {
 
 class Group {
   members: number[]
+  // The value of the mapping epoch counter at the moment this group was
+  // last scanned without finding a conflict. 0 means 'never verified'.
+  verifiedAt = 0
   constructor(readonly origin: number, member: number) { this.members = [member] }
 }
 
@@ -685,37 +688,92 @@ function collapseAutomaton(states: readonly State[]): readonly State[] {
       (groupsByCoreHash[coreHash] || (groupsByCoreHash[coreHash] = [])).push(groups.length - 1)
   }
 
+  // The only mapping entries `canMerge` reads for a given state are those
+  // of its goto targets and its shift targets. Collect them per state in a
+  // flat array (with an index into it), so that a pass can cheaply tell
+  // whether anything a state's comparisons depend on has changed.
+  let depStart = new Int32Array(states.length + 1)
+  for (let i = 0; i < states.length; i++) {
+    let state = states[i], count = state.goto.length
+    for (let action of state.actions) if (action instanceof Shift) count++
+    depStart[i + 1] = depStart[i] + count
+  }
+  let depIds = new Int32Array(depStart[states.length])
+  for (let i = 0, p = 0; i < states.length; i++) {
+    let state = states[i]
+    for (let goto of state.goto) depIds[p++] = goto.target.id
+    for (let action of state.actions) if (action instanceof Shift) depIds[p++] = action.target.id
+  }
+
+  // A monotonically increasing counter, bumped on every change to
+  // `mapping`, along with the counter value at which each entry last
+  // changed. Entries left at 0 have held their initial value throughout.
+  // The counter is bumped once per spill candidate, which stays several
+  // orders of magnitude below the int32 range even for huge grammars.
+  let epoch = 1, mappingEpoch = new Int32Array(states.length)
+  function setMapping(id: number, group: number) {
+    if (mapping[id] != group) {
+      mapping[id] = group
+      mappingEpoch[id] = ++epoch
+    }
+  }
+
   function spill(groupIndex: number, index: number) {
     let group = groups[groupIndex], state = states[group.members[index]]
     let pop = group.members.pop()!
     if (index != group.members.length) group.members[index] = pop
     for (let i = groupIndex + 1; i < groups.length; i++) {
-      mapping[state.id] = i
+      setMapping(state.id, i)
       if (groups[i].origin == group.origin &&
           groups[i].members.every(id => canMerge(state, states[id], mapping))) {
         groups[i].members.push(state.id)
+        groups[i].verifiedAt = 0
         return
       }
     }
-    mapping[state.id] = groups.length
+    setMapping(state.id, groups.length)
     groups.push(new Group(group.origin, state.id))
   }
 
+  // Whether any mapping entry read when comparing this group's members has
+  // changed since the group was verified. Must be checked against the
+  // current state of `mapping`, not a snapshot taken earlier in the pass —
+  // spills keep changing it while the pass runs.
+  function staleSince(group: Group) {
+    for (let id of group.members) {
+      for (let p = depStart[id], e = depStart[id + 1]; p < e; p++)
+        if (mappingEpoch[depIds[p]] > group.verifiedAt) return true
+    }
+    return false
+  }
+
   for (let pass = 1;; pass++) {
-    let conflicts = false, t0 = Date.now()
+    let conflicts = false, t0 = Date.now(), scanned = 0, skipped = 0
     for (let g = 0, startLen = groups.length; g < startLen; g++) {
       let group = groups[g]
+      if (group.members.length < 2) continue
+      // If every pair in this group was found compatible at some earlier
+      // point, and no mapping entry any of those comparisons depends on
+      // has changed since, all of them would still be compatible now.
+      if (group.verifiedAt && !staleSince(group)) { skipped++; continue }
+      scanned++
+      let verifiedAt = epoch, spilled = false
       for (let i = 0; i < group.members.length - 1; i++) {
         for (let j = i + 1; j < group.members.length; j++) {
           let idA = group.members[i], idB = group.members[j]
           if (!canMerge(states[idA], states[idB], mapping)) {
             conflicts = true
+            spilled = true
             spill(g, j--)
           }
         }
       }
+      // Comparisons made before a spill in this group saw a stale mapping
+      // for the spilled state, so don't credit the group as verified.
+      group.verifiedAt = spilled ? 0 : verifiedAt
     }
-    if (timing) console.log(`Collapse pass ${pass}${conflicts ? `` : `, done`} (${((Date.now() - t0) / 1000).toFixed(2)}s)`)
+    if (timing) console.log(`Collapse pass ${pass}${conflicts ? `` : `, done`} (${((Date.now() - t0) / 1000).toFixed(2)}s, ` +
+                            `${scanned} groups scanned, ${skipped} skipped)`)
     if (!conflicts) return mergeStates(states, mapping)
   }
 }
