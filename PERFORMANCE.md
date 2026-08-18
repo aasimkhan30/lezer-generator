@@ -54,6 +54,36 @@ The generator test suite passes: 134 tests.
 
 ## Implemented
 
+### Optional WASM collapse
+
+Large automata flatten their goto and action data into WebAssembly memory once
+and run the complete collapse pass, compatibility checks, spills, mapping epoch
+updates, and dependency invalidation in a single WASM call. Linked membership
+preserves the JavaScript algorithm's swap-with-last traversal order.
+
+The implementation instantiates synchronously in Node and browsers and falls
+back to JavaScript when WebAssembly is unavailable. Set
+`LEZER_GENERATOR_DISABLE_WASM=1` to force the fallback.
+
+On the Optimized 2 T-SQL fixture, WASM reduces total generation from 71.43s to
+63.80s (10.7%) and `Finish automaton` from 36.81s to 30.05s (18.4%). WASM and
+fallback output are byte-identical.
+
+Moving the remaining JavaScript pass orchestration into WASM reduces the
+closure-optimized result from 54.62s to 54.37s. The small additional 0.5% gain
+shows that compatibility checks, rather than the JS/WASM boundary, dominate the
+collapse phase.
+
+### Indexed closure expansion
+
+`closure` now indexes added and existing positions by rule, tracks lookahead
+membership with sets, and explicitly deduplicates its redo queue. This replaces
+the repeated linear scans identified by the CPU profile.
+
+Combined with WASM, this reduces total generation to 54.62s and full automaton
+construction from 29.04s to 21.35s. The combined build is 23.5% faster than
+Optimized 2 and 87.4% faster than the recorded npm baseline.
+
 ### LR(0)-core hash for initial collapse grouping
 
 `collapseAutomaton` now indexes candidate groups by a hash of `(rule ID, dot position)`. `samePosSet` remains the collision check and insertion order is preserved.

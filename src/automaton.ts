@@ -2,6 +2,7 @@ import {Term, TermSet, Rule, cmpSet, Conflicts, union} from "./grammar"
 import {hash, hashString} from "./hash"
 import {GenError} from "./error"
 import {timing} from "./log"
+import {createWasmCollapse} from "./can-merge-wasm"
 
 export class Pos {
   hash: number = 0
@@ -287,22 +288,38 @@ export class State {
 }
 
 function closure(set: readonly Pos[], first: {[name: string]: (Term | null)[]}) {
-  let added: Pos[] = [], redo: Pos[] = []
+  let added: Pos[] = [], addedByRule = new Map<Rule, Pos>(), aheadByRule = new Map<Rule, Set<Term>>()
+  let existingByRule = new Map<Rule, Pos>(), existingIndexByRule = new Map<Rule, number>()
+  for (let i = 0; i < set.length; i++) if (set[i].pos == 0) {
+    existingByRule.set(set[i].rule, set[i])
+    existingIndexByRule.set(set[i].rule, i)
+  }
+  let redo: Pos[] = [], queued = new Set<Pos>()
+  function queue(pos: Pos) {
+    if (!queued.has(pos)) {
+      queued.add(pos)
+      redo.push(pos)
+    }
+  }
   function addFor(name: Term, ahead: readonly Term[], ambigAhead: readonly string[], skipAhead: Term, via: Pos) {
     for (let rule of name.rules) {
-      let add = added.find(a => a.rule == rule)
+      let add = addedByRule.get(rule)
       if (!add) {
-        let existing = set.find(p => p.pos == 0 && p.rule == rule)
+        let existing = existingByRule.get(rule)
         add = existing ? new Pos(rule, 0, existing.ahead.slice(), existing.ambigAhead, existing.skipAhead, existing.via)
           : new Pos(rule, 0, [], none, skipAhead, via)
         added.push(add)
+        addedByRule.set(rule, add)
+        aheadByRule.set(rule, new Set(add.ahead))
       }
       if (add.skipAhead != skipAhead)
         throw new GenError("Inconsistent skip sets after " + via.trail())
       add.ambigAhead = union(add.ambigAhead, ambigAhead)
-      for (let term of ahead) if (!add.ahead.includes(term)) {
+      let aheadSet = aheadByRule.get(rule)!
+      for (let term of ahead) if (!aheadSet.has(term)) {
+        aheadSet.add(term)
         add.ahead.push(term)
-        if (add.rule.parts.length && !add.rule.parts[0].terminal) addTo(add, redo)
+        if (add.rule.parts.length && !add.rule.parts[0].terminal) queue(add)
       }
     }
   }
@@ -316,6 +333,7 @@ function closure(set: readonly Pos[], first: {[name: string]: (Term | null)[]}) 
   }
   while (redo.length) {
     let add = redo.pop()!
+    queued.delete(add)
     addFor(add.rule.parts[0], termsAhead(add.rule, 0, add.ahead, first),
            union(add.rule.conflicts[1].ambigGroups, add.rule.parts.length == 1 ? add.ambigAhead : none),
            add.rule.parts.length == 1 ? add.skipAhead : add.rule.skip, add)
@@ -325,8 +343,8 @@ function closure(set: readonly Pos[], first: {[name: string]: (Term | null)[]}) 
   for (let add of added) {
     add.ahead.sort((a, b) => a.hash - b.hash)
     add.finish()
-    let origIndex = set.findIndex(p => p.pos == 0 && p.rule == add.rule)
-    if (origIndex > -1) result[origIndex] = add
+    let origIndex = existingIndexByRule.get(add.rule)
+    if (origIndex != null) result[origIndex] = add
     else result.push(add)
   }
   return result.sort((a, b) => a.cmp(b))
@@ -665,6 +683,48 @@ function hashPosCore(set: readonly Pos[]) {
   return value
 }
 
+function buildWasmCollapse(states: readonly State[], mapping: readonly number[],
+                           groups: readonly Group[], depStart: Int32Array, depIds: Int32Array) {
+  let gotoCount = 0, actionCount = 0
+  for (let state of states) {
+    gotoCount += state.goto.length
+    actionCount += state.actions.length
+  }
+  let gotoStart = new Int32Array(states.length + 1)
+  let gotoTerm = new Int32Array(gotoCount), gotoTarget = new Int32Array(gotoCount)
+  let actionStart = new Int32Array(states.length + 1), actionSplit = new Int32Array(states.length)
+  let actionTerm = new Int32Array(actionCount), actionKind = new Int32Array(actionCount)
+  let actionValue = new Int32Array(actionCount), actionAux = new Int32Array(actionCount)
+  for (let i = 0, g = 0, a = 0; i < states.length; i++) {
+    let state = states[i]
+    gotoStart[i] = g
+    for (let entry of state.goto) {
+      gotoTerm[g] = entry.term.id
+      gotoTarget[g++] = entry.target.id
+    }
+    actionStart[i] = a
+    let split = state.actions.findIndex(action => action instanceof Reduce)
+    actionSplit[i] = split < 0 ? a + state.actions.length : a + split
+    for (let action of state.actions) {
+      actionTerm[a] = action.term.id
+      if (action instanceof Shift) {
+        actionValue[a] = action.target.id
+      } else {
+        actionKind[a] = 1
+        actionValue[a] = action.rule.name.id
+        actionAux[a] = action.rule.parts.length * 2 + (action.rule.isRepeatWrap ? 1 : 0)
+      }
+      a++
+    }
+  }
+  gotoStart[states.length] = gotoCount
+  actionStart[states.length] = actionCount
+  return createWasmCollapse({
+    mapping, gotoStart, gotoTerm, gotoTarget, actionStart, actionSplit,
+    actionTerm, actionKind, actionValue, actionAux, depStart, depIds, groups
+  })
+}
+
 // Collapse an LR(1) automaton to an LALR-like automaton
 function collapseAutomaton(states: readonly State[]): readonly State[] {
   let mapping: number[] = [], groups: Group[] = [], groupsByCoreHash: {[hash: number]: number[]} = {}
@@ -687,7 +747,6 @@ function collapseAutomaton(states: readonly State[]): readonly State[] {
     if (!state.startRule)
       (groupsByCoreHash[coreHash] || (groupsByCoreHash[coreHash] = [])).push(groups.length - 1)
   }
-
   // The only mapping entries `canMerge` reads for a given state are those
   // of its goto targets and its shift targets. Collect them per state in a
   // flat array (with an index into it), so that a pass can cheaply tell
@@ -703,6 +762,15 @@ function collapseAutomaton(states: readonly State[]): readonly State[] {
     let state = states[i]
     for (let goto of state.goto) depIds[p++] = goto.target.id
     for (let action of state.actions) if (action instanceof Shift) depIds[p++] = action.target.id
+  }
+  let wasmCollapse = states.length < 10000 ? null : buildWasmCollapse(states, mapping, groups, depStart, depIds)
+  if (timing && states.length >= 10000)
+    console.log(`WASM collapse ${wasmCollapse ? "enabled" : "unavailable, using JavaScript"}.`)
+  if (wasmCollapse) {
+    let t0 = Date.now(), result = wasmCollapse.collapse(mapping)
+    if (timing) console.log(`Collapse in WASM, done (${((Date.now() - t0) / 1000).toFixed(2)}s, ` +
+                            `${result.passes} passes, ${result.scanned} groups scanned, ${result.skipped} skipped)`)
+    return mergeStates(states, mapping)
   }
 
   // A monotonically increasing counter, bumped on every change to

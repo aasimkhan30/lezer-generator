@@ -1,5 +1,6 @@
 /node_modules/
 .tern-*
 /dist
+/src/can-merge-wasm-data.ts
 /test/*.js
 /.rpt2_cache

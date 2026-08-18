@@ -45,14 +45,22 @@ for (const grammarFile of grammarFiles) {
     includeNames: true
   }
   const reference = buildReference(source, options)
+  const disableWasm = process.env.LEZER_GENERATOR_DISABLE_WASM
+  delete process.env.LEZER_GENERATOR_DISABLE_WASM
   const optimized = buildOptimized(source, options)
+  process.env.LEZER_GENERATOR_DISABLE_WASM = "1"
+  const fallback = buildOptimized(source, options)
+  if (disableWasm === undefined) delete process.env.LEZER_GENERATOR_DISABLE_WASM
+  else process.env.LEZER_GENERATOR_DISABLE_WASM = disableWasm
 
   compareBytes(grammarFile, "parser", reference.parser, optimized.parser)
   compareBytes(grammarFile, "terms", reference.terms, optimized.terms)
+  compareBytes(grammarFile, "fallback parser", reference.parser, fallback.parser)
+  compareBytes(grammarFile, "fallback terms", reference.terms, fallback.terms)
   console.log(
     `${grammarFile}: parser ${Buffer.byteLength(optimized.parser)} bytes, ` +
     `terms ${Buffer.byteLength(optimized.terms)} bytes`
   )
 }
 
-console.log("All grammar outputs are byte-identical.")
+console.log("All WASM, JavaScript fallback, and reference outputs are byte-identical.")
